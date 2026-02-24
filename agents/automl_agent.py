@@ -217,14 +217,13 @@ class AutoMLAgent:
         }
         if self.time_limit is not None:
             fit_kwargs["time_limit"] = self.time_limit
-        if sample_weight_col:
-            fit_kwargs["sample_weight"] = sample_weight_col
 
         self.predictor = TabularPredictor(
             label=self.label_col,
             problem_type=self.problem_type,
             eval_metric=eval_metric,
             path=ag_save_path,
+            sample_weight=sample_weight_col,
         )
         self.predictor.fit(**fit_kwargs)
         logger.info("✅  Training complete.")
