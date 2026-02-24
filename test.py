@@ -1,9 +1,11 @@
-import traceback
-import pandas as pd
-from agents.automl_agent import train_model
+import os
 
-try:
-    df = pd.read_csv('data/adult_income.csv').head(100)
-    train_model(df, 'income', time_limit=10)
-except Exception as e:
-    traceback.print_exc()
+tests = [
+    ("data/adult_income.csv", "income"),
+    ("data/creditcard.csv", "Class"),
+    ("data/loan_default.csv", "Default")
+]
+
+for path, label in tests:
+    print(f"\nRunning test for {path}")
+    os.system(f"python main.py {path} {label}")
