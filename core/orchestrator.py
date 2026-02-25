@@ -1,30 +1,21 @@
-"""orchestrator.py — Central pipeline coordinator.
+"""core.orchestrator — single entry-point for the end-to-end ML pipeline.
 
-Runs the baseline flow (data cleaning → AutoML training) and optionally
-calls the HPO agent for hyperparameter tuning when ``use_hpo=True``.
-
-Usage
------
-    from core.orchestrator import run_pipeline
-
-    # baseline only
-    run_pipeline("data.csv", label_col="target")
-
-    # baseline + HPO sweep
-    run_pipeline("data.csv", label_col="target", use_hpo=True)
+Coordinates data ingestion, optional HPO, and AutoML training without
+modifying the underlying agent modules.
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from agents.data_agent import load_and_clean
-from agents.automl_agent import train_model
+# ── Logging ──────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -39,64 +30,168 @@ if not logger.handlers:
     )
     logger.addHandler(_handler)
 
+# ── Constants ────────────────────────────────────────────────────────────────
+
+_SEPARATOR = "═" * 60
+_THIN_SEP  = "─" * 60
+
+
+# ── Pipeline ─────────────────────────────────────────────────────────────────
 
 def run_pipeline(
-    csv_path: Union[str, Path],
-    label_col: str,
-    time_limit: int = 60,
+    data_path: str,
+    label: str,
     use_hpo: bool = False,
-    max_trials: int = 5,
+    *,
+    presets: str = "medium_quality_faster_train",
+    time_limit: Optional[int] = None,
+    models_dir: str = "models",
 ) -> Dict[str, Any]:
-    """Execute the end-to-end ML pipeline.
+    """Run the full ML pipeline and return final evaluation metrics.
 
     Parameters
     ----------
-    csv_path : str | Path
-        Path to the dataset CSV file.
-    label_col : str
+    data_path : str
+        Path to a CSV dataset.
+    label : str
         Name of the target / label column.
-    time_limit : int
-        Max seconds for AutoML training (baseline flow).
-    use_hpo : bool
-        If ``True``, run a Ray Tune HPO sweep **after** the baseline
-        training completes.  Defaults to ``False``.
-    max_trials : int
-        Number of HPO trials (only used when ``use_hpo=True``).
+    use_hpo : bool, optional
+        If *True*, delegate training to ``agents.hpo_agent`` (must exist).
+        Defaults to *False* → uses ``agents.automl_agent``.
+    presets : str, optional
+        AutoGluon presets string (only used when ``use_hpo=False``).
+    time_limit : int | None, optional
+        Maximum training time in seconds.
+    models_dir : str, optional
+        Directory to persist trained artefacts.
 
     Returns
     -------
-    dict
-        ``predictor`` — the trained AutoGluon predictor (always present).
-        ``hpo_result`` — best config + accuracy from HPO (only when
-        ``use_hpo=True``).
+    Dict[str, Any]
+        Dictionary of evaluation metric names → float values.
     """
 
-    result: Dict[str, Any] = {}
+    _log_header("Pipeline started")
+    t_start: float = time.perf_counter()
 
-    # ── Step 1: Data Cleaning ────────────────────────────────────────
-    logger.info("── Step 1/2: Data Cleaning ──")
-    df = load_and_clean(filepath=csv_path, label_col=label_col)
+    # ── 1. Data ingestion ────────────────────────────────────────────────
+    logger.info("📂  Stage 1 / 3 — Loading & cleaning data")
+    from agents.data_agent import load_and_clean  # noqa: WPS433
 
-    # ── Step 2: AutoML Training (baseline) ───────────────────────────
-    logger.info("── Step 2/2: AutoML Training ──")
+    df: pd.DataFrame = load_and_clean(filepath=data_path, label_col=label)
+    logger.info(
+        "✔️   Data ready — %s rows × %s columns",
+        f"{len(df):,}",
+        len(df.columns),
+    )
+
+    # ── 2. Training ──────────────────────────────────────────────────────
+    if use_hpo:
+        logger.info("🔬  Stage 2 / 3 — Training via HPO agent")
+        predictor = _run_hpo_agent(df, label, time_limit=time_limit, models_dir=models_dir)
+    else:
+        logger.info("🚀  Stage 2 / 3 — Training via AutoML agent")
+        predictor = _run_automl_agent(
+            df, label, presets=presets, time_limit=time_limit, models_dir=models_dir,
+        )
+
+    # ── 3. Final evaluation ──────────────────────────────────────────────
+    logger.info("📊  Stage 3 / 3 — Final evaluation")
+    metrics: Dict[str, Any] = _collect_metrics(predictor, df, label)
+
+    elapsed: float = round(time.perf_counter() - t_start, 2)
+    _log_summary(metrics, elapsed)
+
+    return metrics
+
+
+# ── Private helpers ──────────────────────────────────────────────────────────
+
+def _run_automl_agent(
+    df: pd.DataFrame,
+    label: str,
+    *,
+    presets: str,
+    time_limit: Optional[int],
+    models_dir: str,
+) -> Any:
+    """Delegate to *agents.automl_agent.train_model*."""
+    from agents.automl_agent import train_model  # noqa: WPS433
+
     predictor = train_model(
         df=df,
-        label_col=label_col,
+        label_col=label,
+        presets=presets,
         time_limit=time_limit,
+        models_dir=models_dir,
     )
-    result["predictor"] = predictor
+    return predictor
 
-    # ── Optional: HPO Sweep ──────────────────────────────────────────
-    if use_hpo:
-        logger.info("── Bonus: HPO Sweep (Ray Tune) ──")
-        from agents.hpo_agent import tune_hyperparameters
 
-        hpo_result = tune_hyperparameters(
-            df=df,
-            label_col=label_col,
-            max_trials=max_trials,
+def _run_hpo_agent(
+    df: pd.DataFrame,
+    label: str,
+    *,
+    time_limit: Optional[int],
+    models_dir: str,
+) -> Any:
+    """Dynamically import and run *agents.hpo_agent* if available."""
+    try:
+        hpo_module = importlib.import_module("agents.hpo_agent")
+    except ModuleNotFoundError:
+        logger.error(
+            "❌  'agents.hpo_agent' not found.  "
+            "Falling back to the default AutoML agent."
         )
-        result["hpo_result"] = hpo_result
+        return _run_automl_agent(
+            df, label, presets="medium_quality_faster_train",
+            time_limit=time_limit, models_dir=models_dir,
+        )
 
-    logger.info("✅  Pipeline complete.")
-    return result
+    if not hasattr(hpo_module, "train_model"):
+        raise AttributeError(
+            "agents.hpo_agent exists but does not expose a 'train_model' callable."
+        )
+
+    logger.info("🔬  Dispatching to hpo_agent.train_model …")
+    predictor = hpo_module.train_model(
+        df=df,
+        label_col=label,
+        time_limit=time_limit,
+        models_dir=models_dir,
+    )
+    return predictor
+
+
+def _collect_metrics(predictor: Any, df: pd.DataFrame, label: str) -> Dict[str, Any]:
+    """Call ``predictor.evaluate`` and guarantee all values are floats."""
+    raw: Dict[str, Any] = predictor.evaluate(df)
+
+    metrics: Dict[str, Any] = {}
+    for key, value in raw.items():
+        try:
+            metrics[key] = float(value)
+        except (TypeError, ValueError):
+            logger.warning("⚠️   Metric '%s' could not be cast to float — skipped.", key)
+
+    return metrics
+
+
+# ── Pretty-print helpers ─────────────────────────────────────────────────────
+
+def _log_header(title: str) -> None:
+    print(f"\n{_SEPARATOR}")
+    print(f"  🤖  {title}")
+    print(_SEPARATOR)
+
+
+def _log_summary(metrics: Dict[str, Any], elapsed: float) -> None:
+    print(f"\n{_SEPARATOR}")
+    print("  📋  Pipeline Results")
+    print(_THIN_SEP)
+    for name, value in metrics.items():
+        print(f"    {name:<25s} : {value}")
+    print(_THIN_SEP)
+    print(f"    {'elapsed (s)':<25s} : {elapsed}")
+    print(f"{_SEPARATOR}\n")
+    logger.info("✅  Pipeline finished in %.2fs", elapsed)
