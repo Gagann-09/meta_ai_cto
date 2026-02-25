@@ -76,10 +76,12 @@ class AutoMLAgent:
         self._handle_imbalance()
         self._split_data()
         self._setup_mlflow()
-        self._train()
-        self._evaluate()
-        self._log_to_mlflow()
-        self._save_model()
+        with mlflow.start_run(run_name=f"autogluon_{self.problem_type}"):
+            self._train()
+            self._evaluate()
+            self._log_to_mlflow()
+            self._save_model()
+            
         self._print_summary()
 
         logger.info("✅  AutoMLAgent pipeline complete.")
@@ -165,6 +167,7 @@ class AutoMLAgent:
         )
 
     def _setup_mlflow(self) -> None:
+        mlflow.set_tracking_uri("sqlite:///mlflow.db")
         mlflow.set_experiment(_MLFLOW_EXPERIMENT)
         logger.info("📋  MLflow experiment: '%s'", _MLFLOW_EXPERIMENT)
 
@@ -284,29 +287,34 @@ class AutoMLAgent:
     def _log_to_mlflow(self) -> None:
         assert self.predictor is not None
 
-        with mlflow.start_run(run_name=f"autogluon_{self.problem_type}") as run:
-            mlflow.log_param("problem_type", self.problem_type)
-            mlflow.log_param("presets", self.presets)
-            mlflow.log_param("label_col", self.label_col)
-            mlflow.log_param("train_rows", len(self.train_df) if self.train_df is not None else 0)
-            mlflow.log_param("test_rows", len(self.test_df) if self.test_df is not None else 0)
-            mlflow.log_param("n_features", len(self.df.columns) - 1)
-            mlflow.log_param("is_imbalanced", getattr(self, "_is_imbalanced", False))
+        mlflow.log_param("problem_type", self.problem_type)
+        mlflow.log_param("presets", self.presets)
+        mlflow.log_param("label_col", self.label_col)
+        mlflow.log_param("train_rows", len(self.train_df) if self.train_df is not None else 0)
+        mlflow.log_param("test_rows", len(self.test_df) if self.test_df is not None else 0)
+        mlflow.log_param("n_features", len(self.df.columns) - 1)
+        mlflow.log_param("is_imbalanced", getattr(self, "_is_imbalanced", False))
 
-            for metric_name, metric_val in self.metrics.items():
-                if metric_name == "leaderboard":
-                    continue
-                if metric_val is not None:
-                    mlflow.log_metric(metric_name, metric_val)
+        ag_metrics = self.predictor.evaluate(self.test_df)
+        for metric_name, metric_val in ag_metrics.items():
+            mlflow.log_metric(metric_name, float(metric_val))
 
-            if "leaderboard" in self.metrics:
-                lb_path = self.models_dir / "leaderboard.csv"
-                self.metrics["leaderboard"].to_csv(lb_path, index=False)
-                mlflow.log_artifact(str(lb_path))
+        for metric_name, metric_val in self.metrics.items():
+            if metric_name == "leaderboard":
+                continue
+            if metric_name not in ag_metrics and metric_val is not None:
+                mlflow.log_metric(metric_name, float(metric_val))
 
-            mlflow.log_param("model_path", str(self.models_dir / "autogluon_model"))
+        if "leaderboard" in self.metrics:
+            lb_path = self.models_dir / "leaderboard.csv"
+            self.metrics["leaderboard"].to_csv(lb_path, index=False)
+            mlflow.log_artifact(str(lb_path))
 
-            logger.info("📋  MLflow run logged — ID: %s", run.info.run_id)
+        mlflow.log_param("model_path", str(self.models_dir / "autogluon_model"))
+
+        active_run = mlflow.active_run()
+        if active_run:
+            logger.info("📋  MLflow run logged — ID: %s", active_run.info.run_id)
 
     def _save_model(self) -> None:
         assert self.predictor is not None
